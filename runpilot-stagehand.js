@@ -45,6 +45,7 @@ const http                              = require('http');
 const fs                                = require('fs');
 const path                              = require('path');
 const verificationEvidence              = require('./lib/verification-evidence.js');
+const loginDetection                    = require('./lib/login-detection.js');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const cfg = {
@@ -227,7 +228,11 @@ async function snapshotAppState(page) {
   try { title = await page.title(); } catch (_) {}
   const blob = (url + ' ' + title).toLowerCase();
   appState.currentPage = url;
-  appState.loggedIn = !/(login|sign[-_ ]?in|auth|sso)/i.test(blob);
+  const urlLooksAuthenticated = !/(login|sign[-_ ]?in|auth|sso)/i.test(blob);
+  const loginFormVisible = await loginDetection.hasVisibleLoginForm(page);
+  // A visible login form is decisive: it can only downgrade a false "loggedIn=true" guess to
+  // the correct "false" — it never overrides a page that already looks unauthenticated.
+  appState.loggedIn = loginFormVisible ? false : urlLooksAuthenticated;
   return { url, title, loggedIn: appState.loggedIn };
 }
 
@@ -1934,7 +1939,8 @@ async function verifyStepExpected(stagehand, page, stepLabel, expected) {
   let result = await verifyStepExpectedInner(stagehand, page, stepLabel, expected);
 
   const after = await verificationEvidence.captureEvidence(page).catch(() => null);
-  rlog(stepLabel + ':A11Y_EVIDENCE:' + verificationEvidence.summarize(after));
+  rlog(stepLabel + ':A11Y_EVIDENCE:' + verificationEvidence.summarize(after)
+    + ' ' + JSON.stringify(verificationEvidence.toStructured(after)));
 
   if (before && after) {
     const conflict =
@@ -1948,7 +1954,8 @@ async function verifyStepExpected(stagehand, page, stepLabel, expected) {
       try { await page.waitForTimeout(500); } catch (_) { /* ignore */ }
       const retried = await verifyStepExpectedInner(stagehand, page, stepLabel, expected);
       const afterRetry = await verificationEvidence.captureEvidence(page).catch(() => null);
-      rlog(stepLabel + ':A11Y_EVIDENCE_RETRY:' + verificationEvidence.summarize(afterRetry));
+      rlog(stepLabel + ':A11Y_EVIDENCE_RETRY:' + verificationEvidence.summarize(afterRetry)
+        + ' ' + JSON.stringify(verificationEvidence.toStructured(afterRetry)));
       result = retried;
     }
   }
@@ -7250,27 +7257,18 @@ function looksLikeLogoutStep(desc) {
 /** True when the live page already looks authenticated (dashboard / profile chip / no login form). */
 async function pageLooksLoggedIn(page) {
   try {
-    const snap = await snapshotAppState(page);
+    const snap = await snapshotAppState(page); // already folds in hasVisibleLoginForm() evidence
+    if (!snap.loggedIn) return false;
     const ui = await page.evaluate(() => {
       const text = ((document.body && document.body.innerText) || '').toLowerCase();
-      const pwd = document.querySelector('input[type="password"]');
-      const pwdVisible = !!(pwd && pwd.offsetHeight > 0
-        && window.getComputedStyle(pwd).display !== 'none'
-        && window.getComputedStyle(pwd).visibility !== 'hidden');
-      const clickables = Array.from(document.querySelectorAll('button, a, [role="button"], [type="submit"]'));
-      const loginBtn = clickables.some(el => {
-        const t = ((el.innerText || el.textContent || el.getAttribute('aria-label') || '') + '').trim();
-        return /^(login|sign in|sign-in)$/i.test(t) && el.offsetHeight > 0;
-      });
       const hasWelcome = /\bwelcome\b/.test(text) || /\bdashboard\b/.test(text);
       const hasAvatar = !!document.querySelector(
         '[class*="avatar" i], [class*="user-menu" i], [aria-label*="profile" i], [aria-label*="account" i]'
       );
-      return { pwdVisible, loginBtn, hasWelcome, hasAvatar };
+      return { hasWelcome, hasAvatar };
     });
-    if (ui.pwdVisible && ui.loginBtn) return false;
     if (ui.hasWelcome || ui.hasAvatar) return true;
-    return !!snap.loggedIn && !(ui.pwdVisible && ui.loginBtn);
+    return !!snap.loggedIn;
   } catch (_) {
     return !!cfg.isProxy;
   }
@@ -9470,7 +9468,14 @@ function buildAzureClient() {
         || (planned && String(planned.businessAction || '').toUpperCase() === 'LOGIN');
       if (loginish && !looksLikeLogoutStep(desc) && klass.kind !== 'META') {
         const alreadyIn = cfg.isProxy || await pageLooksLoggedIn(page);
-        if (alreadyIn) {
+        // Safety net: even if the page-level signal says "already logged in", a currently
+        // visible, real login form (password field + Login control) is stronger, narrower
+        // evidence that THIS specific credential step must not be skipped — prevents silently
+        // submitting an empty login form when the broader "looks logged in" guess is wrong.
+        // Proxy/SSO mode is explicit user opt-in and is never overridden by this check.
+        if (alreadyIn && !cfg.isProxy && await loginDetection.hasVisibleLoginForm(page)) {
+          rlog(stepLabel + ':LOGIN_SKIP_OVERRIDE:visible login form detected — executing credential step instead of skipping');
+        } else if (alreadyIn) {
           klass = { kind: 'META', reason: 'already logged in (SSO/session) — skip login/credentials' };
         }
       }
@@ -9640,6 +9645,21 @@ function buildAzureClient() {
           }
           if (formDone) {
             formFilledThisStep = true;
+            // Defense-in-depth: confirm the intended typed value actually landed in some visible
+            // field, independent of the step's `expected` wording (e.g. generic "Field accepts
+            // input" never triggers verifyTypedInputValueExpected's narrow regex). Never blocks
+            // or throws — logs the evidence and does one bounded re-fill attempt on mismatch.
+            const intendedValue = extractQuotedPhrase(subDesc);
+            if (intendedValue) {
+              const landed = await loginDetection.fieldHasValue(page, intendedValue);
+              if (landed === false) {
+                rlog(doneLabel + ':FILL_EVIDENCE:WARN value "' + intendedValue.slice(0, 40)
+                  + '" not found in any visible field after fill — retrying once');
+                await tryDirectFormAction(page, subDesc, subLabel, stagehand).catch(() => false);
+              } else if (landed === true) {
+                rlog(doneLabel + ':FILL_EVIDENCE:OK value confirmed present in a field');
+              }
+            }
             rlog(doneLabel + ':Form completed via human-like fill');
             actResult = { message: 'Form filled and progressed via human-like intelligence' };
             if (multi && si < subActions.length - 1) await humanPause(page, 200, 450);

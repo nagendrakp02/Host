@@ -1,0 +1,22 @@
+{
+  "name": "agentassist-runtime",
+  "version": "1.0.0",
+  "description": "Playwright runtime for iWAgent Agent Assist",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/verification-evidence.test.js test/login-detection.test.js"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "^3.5.0",
+    "openai": "^6.43.0",
+    "playwright": "^1.49.0",
+    "selenium-webdriver": "^4.28.0",
+    "zod": "^4.4.3"
+  },
+  "overrides": {
+    "chrome-launcher": "0.15.2"
+  }
+}

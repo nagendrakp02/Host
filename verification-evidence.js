@@ -7,7 +7,7 @@
  * and fails closed (returns an empty/inert bundle, never throws) whenever a signal can't be read.
  */
 
-const ALERT_LINE = /^(alert|status|alertdialog)\s*(?:"([^"]*)")?/i;
+const ALERT_ROLES = ['alert', 'status', 'alertdialog'];
 
 // One listener-state entry per page, so page.on() is registered exactly once per page instance
 // even though captureNetworkEvidence() may be called many times during a run.
@@ -59,27 +59,29 @@ function captureNetworkEvidence(page) {
 
 /**
  * Captures accessibility-tree alert/status/alertdialog regions via Playwright's public
- * ariaSnapshot() API — the same approach used by playwright-mcp-runtime/lib/snapshot.js and
- * the Java-side AccessibilityMatcher. Catches implicit-role cases the existing [role="alert"]
+ * getByRole() query API — querying each role directly rather than snapshotting the whole
+ * subtree as text and parsing it. This is more robust (no text-format parsing that could drift
+ * across Playwright versions) and faster than the earlier ariaSnapshot()-based implementation,
+ * while returning the exact same shape (array of "role" or "role: name" strings) so every
+ * caller in this file is unaffected. Catches implicit-role cases the existing [role="alert"]
  * CSS-attribute selectors elsewhere in this file miss. Never throws.
  */
 async function captureAccessibilityAlerts(page) {
   const alerts = [];
-  try {
-    const yaml = await page.locator('body').ariaSnapshot();
-    for (const rawLine of String(yaml || '').split('\n')) {
-      let line = rawLine.trim();
-      if (!line) continue;
-      if (line.startsWith('-')) line = line.slice(1).trim();
-      const m = ALERT_LINE.exec(line);
-      if (m) {
-        const role = m[1].toLowerCase();
-        const name = m[2];
+  for (const role of ALERT_ROLES) {
+    try {
+      const locator = page.getByRole(role);
+      const count = await locator.count();
+      for (let i = 0; i < count; i++) {
+        let name = '';
+        try {
+          name = String((await locator.nth(i).textContent()) || '').trim();
+        } catch (_) { /* this node's name couldn't be read — still record the role hit */ }
         alerts.push(role + (name ? ': ' + name : ''));
       }
+    } catch (_) {
+      // This role query failed in this context — degrade to no alerts for this role, never throw.
     }
-  } catch (_) {
-    // Accessibility tree unavailable in this context — degrade to no alerts, never throw.
   }
   return alerts;
 }
@@ -122,6 +124,22 @@ function summarize(evidence) {
   return parts.join('; ');
 }
 
+/**
+ * Compact, structured (JSON-serializable) view of an evidence bundle — the same information
+ * summarize() renders as a human-readable line, shaped for machine parsing / future cross-run
+ * analytics instead. Callers append `JSON.stringify(toStructured(evidence))` alongside the
+ * existing summarize() text on the same rlog() line, so today's log format stays backward
+ * compatible while becoming additionally queryable.
+ */
+function toStructured(evidence) {
+  if (!evidence) return null;
+  return {
+    alerts: hasAlertRegion(evidence) ? evidence.alerts.slice() : [],
+    consoleErrorCount: evidence.network.consoleErrors.length,
+    failedResponseCount: evidence.network.failedResponses.length,
+  };
+}
+
 module.exports = {
   captureNetworkEvidence,
   captureAccessibilityAlerts,
@@ -130,4 +148,5 @@ module.exports = {
   hasNewFailureSignal,
   alertCleared,
   summarize,
+  toStructured,
 };
